@@ -1,92 +1,170 @@
-
-#ifndef THREAD_POOL_H
-#define THREAD_POOL_H
-
-#include <vector>
-#include <queue>
-#include <memory>
-#include <thread>
 #include <mutex>
-#include <condition_variable>
-#include <future>
+#include <thread>
 #include <functional>
-#include <stdexcept>
-
+#include <condition_variable>
+#include <deque>
+#include <vector>
+#include <memory>
+#include <assert.h>
+#include <unistd.h>
 class ThreadPool
 {
 public:
-    // 构造函数
-    ThreadPool(size_t);
-    template <class F, class... Args>
-    auto enqueue(F &&f, Args &&...args) -> std::future<typename std::result_of<F(Args...)>::type>;
-    ~ThreadPool();
+  // 设置最大的任务数量
+  void setMaxQueueSize(int maxsize)
+  {
+    this->maxQueueSize_ = maxsize;
+  }
+  ThreadPool() {}
+
+  ~ThreadPool()
+  {
+    if (running_)
+    {
+      stop();
+    }
+  }
+  // 停止所有线程
+  void stop()
+  {
+    {
+      std::lock_guard<std::mutex> leks(this->mutex_);
+      running_ = false;
+      cond_empty.notify_all();
+      cond_full.notify_all();
+    }
+    // 回收所有线程
+    for (auto &thd : this->threads_)
+    {
+      thd->join();
+    }
+  }
+  // 开始启动。
+  void start(int numThreads)
+  {
+    assert(threads_.empty());
+
+    running_ = true;
+    // 预分配
+    threads_.reserve(numThreads);
+
+    for (int i = 0; i < numThreads; ++i)
+    {
+      // 依次增加线程
+      threads_.emplace_back(new std::thread(std::bind(&ThreadPool::runInThread, this)));
+    }
+    // 如果需要 0 个线程， 并且回调函数不为空 就调用回调函数
+    if (numThreads == 0 && callbackfunction_)
+    {
+      callbackfunction_();
+    }
+  }
+  // 设置该线程池的回调函数
+  void setcallbackfunction(std::function<void()> &that)
+  {
+    this->callbackfunction_ = that;
+  }
+
+  // 传入函数
+  void run(std::function<void()> task)
+  {
+    // 如果当前没有创建线程，就直接运行。
+    if (threads_.empty())
+    {
+      task();
+    }
+    else
+    {
+      std::unique_lock<std::mutex> lths(this->mutex_);
+      //  直到 runnning = true && 最大任务队列 > 0 并且当前任务的数量 >= 最大任务数量。
+      while (isFull() && running_)
+      {
+        cond_full.wait(lths);
+      }
+      if (!running_)
+      {
+        return;
+      }
+      assert(!isFull());
+
+      this->tasks_.push_back(std::move(task));
+      cond_empty.notify_one();
+    }
+  }
 
 private:
-    // need to keep track of threads so we can join them
-    std::vector<std::thread> workers;
-    // the task queue
-    std::queue<std::function<void()>> tasks;
+  mutable std::mutex mutex_;
+  bool isFull() const
+  {
+    std::lock_guard<std::mutex> lhs(this->mutex_);
+    return maxQueueSize_ > 0 && tasks_.size() >= maxQueueSize_;
+  }
+  //
+  void runInThread()
+  {
+    if (callbackfunction_)
+    {
+      callbackfunction_();
+    }
+    while (running_)
+    {
+      std::function<void()> task(take());
+      if (task)
+      {
+        task();
+      }
+    }
+  }
+  // 从任务队列中，获取一个任务并且返回。
+  std::function<void()> take()
+  {
+    std::unique_lock<std::mutex> lths(this->mutex_);
 
-    // synchronization
-    std::mutex queue_mutex;
-    std::condition_variable condition;
-    bool stop;
+    while (tasks_.empty() && running_)
+    {
+      cond_empty.wait(lths);
+    }
+    std::function<void()> task;
+
+    if (!tasks_.empty())
+    {
+      task = tasks_.front();
+      tasks_.pop_front();
+
+      if (maxQueueSize_ > 0)
+      {
+        cond_full.notify_one();
+      }
+    }
+    return task;
+  }
+
+  std::function<void()> callbackfunction_;
+
+  // 任务队列
+  std::deque<std::function<void()>> tasks_;
+  // 线程对象
+  std::vector<std::unique_ptr<std::thread>> threads_;
+  // 最大任务队列数量。
+  size_t maxQueueSize_ = 0;
+  // 当前线程池是否正在运行
+  bool running_ = false;
+  // 条件变量
+  std::condition_variable cond_empty;
+  std::condition_variable cond_full;
 };
 
-// the constructor just launches some amount of workers
-ThreadPool::ThreadPool(size_t threads)
-    : stop(false)
-{
-    for (size_t i = 0; i < threads; ++i)
-        workers.emplace_back([this]{
-                                 for (;;)
-                                 {
-                                     std::function<void()> task;
-                                     {
-                                         // 上锁
-                                         std::unique_lock<std::mutex> lock(this->queue_mutex);
-                                         // 信号量阻塞,直到满足 stop 为真(现在线程池需要关闭),或者当前任务队列非空。
-                                         this->condition.wait(lock,[this]{ return this->stop || !this->tasks.empty(); });
-                                         // 
-                                         if (this->stop && this->tasks.empty())
-                                             return;
-                                         task = std::move(this->tasks.front());
-                                         this->tasks.pop();
-                                     }
-                                     task();
-                                 }
-                             }
-                             );
-}
 
-// add new work item to the pool
-template <class F, class... Args>
-auto ThreadPool::enqueue(F &&f, Args &&...args)-> std::future<typename std::result_of<F(Args...)>::type>
+int main(int argc, char *argv[])
 {
-    using return_type = typename std::result_of<F(Args...)>::type;
-    auto task = std::make_shared<std::packaged_task<return_type()>>(std::bind(std::forward<F>(f), std::forward<Args>(args)...));
-    std::future<return_type> res = task->get_future();
-    {
-        std::unique_lock<std::mutex> lock(queue_mutex);
-        // don't allow enqueueing after stopping the pool
-        if (stop)
-            throw std::runtime_error("enqueue on stopped ThreadPool");
-        tasks.emplace([task](){ (*task)(); });
-    }
-    condition.notify_one();
-    return res;
-}
+  ThreadPool st;
+  st.setMaxQueueSize(10);
+  std::function<void()> callback = [](){ printf("hello,world!\n");};
+  st.setcallbackfunction(callback);
+  st.run(callback);
+  sleep(10);
+  st.stop();
 
-// the destructor joins all threads
-inline ThreadPool::~ThreadPool()
-{
-    {
-        std::unique_lock<std::mutex> lock(queue_mutex);
-        stop = true;
-    }
-    condition.notify_all();
-    for (std::thread &worker : workers)
-        worker.join();
-}
 
-#endif
+  return 0;
+}
